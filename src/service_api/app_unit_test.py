@@ -9,7 +9,18 @@ from pydantic import ValidationError
 from service_api.app import create_app
 from service_api.config import Settings, get_settings
 from service_api.dependencies import get_policy_loan_repository
-from service_api.models.loans import CreatePolicyLoanRequest, PolicyLoan
+from service_api.models.loans import (
+    CreateLoanRepaymentRequest,
+    CreatePolicyLoanRequest,
+    LoanRepayment,
+    PolicyLoan,
+    PolicyLoanStatus,
+)
+from service_api.repositories.loans import (
+    PolicyLoanClosedError,
+    PolicyLoanNotFoundError,
+    RepaymentExceedsBalanceError,
+)
 
 
 @pytest.mark.asyncio
@@ -37,6 +48,7 @@ async def test_loans_requires_api_key() -> None:
         disbursed_at=datetime(2026, 1, 1, tzinfo=UTC),
         principal_balance_cents=2500000,
         interest_balance_cents=6468,
+        status=PolicyLoanStatus.OPEN,
     )
 
     class FakePolicyLoanRepository:
@@ -72,6 +84,7 @@ async def test_create_loan_returns_created_loan() -> None:
         disbursed_at=datetime(2026, 1, 1, tzinfo=UTC),
         principal_balance_cents=2500000,
         interest_balance_cents=0,
+        status=PolicyLoanStatus.OPEN,
     )
     received_requests: list[CreatePolicyLoanRequest] = []
 
@@ -217,3 +230,89 @@ def test_create_loan_rejects_values_postgres_cannot_store(
 
     with pytest.raises(ValidationError):
         CreatePolicyLoanRequest.model_validate(valid_fields | invalid_fields)
+
+
+@pytest.mark.asyncio
+async def test_create_repayment_returns_allocation_and_remaining_balance() -> None:
+    loan_uid = UUID("00000000-0000-0000-0000-000000000001")
+    repayment = LoanRepayment(
+        amount_applied_to_interest_cents=6468,
+        amount_applied_to_principal_cents=3532,
+        remaining_balance_cents=2496468,
+    )
+    received_requests: list[tuple[UUID, CreateLoanRepaymentRequest]] = []
+
+    class FakePolicyLoanRepository:
+        async def create_repayment(
+            self,
+            received_loan_uid: UUID,
+            request: CreateLoanRepaymentRequest,
+        ) -> LoanRepayment:
+            received_requests.append((received_loan_uid, request))
+            return repayment
+
+    settings = Settings(api_key="test-key")
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_policy_loan_repository] = FakePolicyLoanRepository
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            f"/loans/{loan_uid}/repayments",
+            headers={"X-API-Key": "test-key"},
+            json={"amount_cents": 10000},
+        )
+
+    assert response.status_code == 201
+    assert response.json() == repayment.model_dump(mode="json")
+    assert received_requests == [
+        (loan_uid, CreateLoanRepaymentRequest(amount_cents=10000))
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("repository_error", "expected_status", "expected_detail"),
+    [
+        (PolicyLoanNotFoundError(), 404, "Policy loan not found"),
+        (PolicyLoanClosedError(), 409, "Policy loan is closed"),
+        (
+            RepaymentExceedsBalanceError(),
+            409,
+            "Repayment amount exceeds the outstanding balance",
+        ),
+    ],
+)
+async def test_create_repayment_returns_domain_errors(
+    repository_error: Exception,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    class FakePolicyLoanRepository:
+        async def create_repayment(
+            self,
+            loan_uid: UUID,
+            request: CreateLoanRepaymentRequest,
+        ) -> LoanRepayment:
+            raise repository_error
+
+    settings = Settings(api_key="test-key")
+    app = create_app()
+    app.dependency_overrides[get_settings] = lambda: settings
+    app.dependency_overrides[get_policy_loan_repository] = FakePolicyLoanRepository
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(
+            "/loans/00000000-0000-0000-0000-000000000001/repayments",
+            headers={"X-API-Key": "test-key"},
+            json={"amount_cents": 10000},
+        )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
